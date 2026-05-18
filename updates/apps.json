@@ -1,0 +1,26 @@
+{
+  "apps": [
+    {
+      "app_id": "app1",
+      "app_name": "Application 1",
+      "splunk_rest_url": "https://<splunk-host-for-app1>:8089",
+      "splunk_username": "<userid-for-app1>",
+      "splunk_password": "<password-for-app1>",
+      "splunk_index": "<index-for-app1>",
+      "splunk_ssl_verify": "false",
+      "splunk_hec_url": "",
+      "splunk_hec_token": ""
+    },
+    {
+      "app_id": "app2",
+      "app_name": "Application 2",
+      "splunk_rest_url": "https://<splunk-host-for-app2>:8089",
+      "splunk_username": "<userid-for-app2>",
+      "splunk_password": "<password-for-app2>",
+      "splunk_index": "<index-for-app2>",
+      "splunk_ssl_verify": "false",
+      "splunk_hec_url": "",
+      "splunk_hec_token": ""
+    }
+  ]
+}
