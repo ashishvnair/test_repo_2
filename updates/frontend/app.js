@@ -113,6 +113,8 @@ async function runRCA(skipVectorCheck = false) {
   document.getElementById('summary-bar').classList.remove('visible');
   document.getElementById('results').innerHTML = '';
   document.getElementById('sidebar-content').innerHTML = '';
+  const msgEl = document.getElementById('pipeline-msg');
+  if (msgEl) { msgEl.style.display = 'none'; msgEl.innerHTML = ''; }
   hideFeed();
   showPage('pipeline');
 
@@ -357,7 +359,31 @@ function handleSSE(evt) {
       setTimeout(() => showSimilarReportsPanel(_similarReports), 400);
       return;
     }
-    const results = data && data.results ? data.results : (Array.isArray(data) ? data : []);
+
+    const results        = data && data.results ? data.results : (Array.isArray(data) ? data : []);
+    const pipelineStatus = data && data.pipeline_status;
+    const pipelineMsg    = data && data.message;
+
+    // ── Empty / error result — stay on pipeline page, show message ────────
+    if (!results || results.length === 0) {
+      _running = false;
+      const btn = document.getElementById('btn-run');
+      if (btn) { btn.disabled = false; btn.textContent = '▶ Run RCA'; }
+
+      // Show inline message inside the pipeline card
+      const msgEl = document.getElementById('pipeline-msg');
+      if (msgEl) {
+        const isError = pipelineStatus === 'fetch_error';
+        msgEl.className = 'pipeline-msg ' + (isError ? 'pipeline-msg--error' : 'pipeline-msg--empty');
+        msgEl.innerHTML = isError
+          ? '❌ <strong>Connection failed</strong><br><span>' + esc(pipelineMsg || 'Could not connect to log source.') + '</span>'
+          : '⚠️ <strong>No results</strong><br><span>' + esc(pipelineMsg || 'No logs or error patterns found in the selected time window.') + '</span>';
+        msgEl.style.display = 'block';
+      }
+      return;   // DO NOT navigate to results page
+    }
+
+    // ── Normal result — render and navigate ───────────────────────────────
     _results = results;
     renderResults(results);
     renderSummary(results);
