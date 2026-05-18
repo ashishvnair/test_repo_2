@@ -8,13 +8,18 @@ Auth mode is selected by env vars:
 
 SSL:
   - If LLM_SSL_CERT_FILE is set → that PEM file is set as SSL_CERT_FILE
-    (needed for corporate endpoints with internal CA chains)
+
+Token refresh:
+  - Bearer tokens typically expire every ~20 min.
+  - Call set_auth_token(new_token) or POST /update-token on the MCP server
+    to hot-swap the token without restarting the server.
 """
 
 import json
 import logging
 import os
 import re
+import threading
 from typing import Any, Optional
 
 from openai import OpenAI
@@ -22,53 +27,66 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration from environment (set by .env / bat files)
+# Configuration from environment
 # ─────────────────────────────────────────────────────────────────────────────
-LLM_BASE_URL    = os.getenv("LLM_BASE_URL",    "http://host.docker.internal:1234/v1")
-LLM_API_KEY     = os.getenv("LLM_API_KEY",     "lm-studio")
-LLM_AUTH_TOKEN  = os.getenv("LLM_AUTH_TOKEN",  "")          # Bearer token (corporate endpoint)
-LLM_SSL_CERT    = os.getenv("LLM_SSL_CERT_FILE", "")        # path to CA chain PEM
-CHAT_MODEL      = os.getenv("LLM_CHAT_MODEL",  "meta-llama-3.1-8b-instruct@q3_k_l")
-EMBED_MODEL     = os.getenv("EMBED_MODEL",     "text-embedding-nomic-embed-text-v1.5")
-EMBED_DIMS      = int(os.getenv("EMBED_DIMS",  "1024"))
+LLM_BASE_URL   = os.getenv("LLM_BASE_URL",    "http://host.docker.internal:1234/v1")
+LLM_API_KEY    = os.getenv("LLM_API_KEY",     "lm-studio")
+LLM_SSL_CERT   = os.getenv("LLM_SSL_CERT_FILE", "")
+CHAT_MODEL     = os.getenv("LLM_CHAT_MODEL",  "meta-llama-3.1-8b-instruct@q3_k_l")
+EMBED_MODEL    = os.getenv("EMBED_MODEL",     "text-embedding-nomic-embed-text-v1.5")
+EMBED_DIMS     = int(os.getenv("EMBED_DIMS",  "1024"))
 
 # Apply SSL cert override at import time so all http libs pick it up
 if LLM_SSL_CERT:
-    os.environ["SSL_CERT_FILE"] = LLM_SSL_CERT
+    os.environ["SSL_CERT_FILE"]      = LLM_SSL_CERT
     os.environ["REQUESTS_CA_BUNDLE"] = LLM_SSL_CERT
     logger.info("SSL_CERT_FILE set to: %s", LLM_SSL_CERT)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Mutable token state — updated by set_auth_token() without server restart
+# ─────────────────────────────────────────────────────────────────────────────
+_token_lock            = threading.Lock()
+_current_auth_token    = os.getenv("LLM_AUTH_TOKEN", "")  # live token
 _client: Optional[OpenAI] = None
-_working_chat_model: Optional[str] = None  # cached after first successful call
+_working_chat_model: Optional[str] = None
+
+
+def set_auth_token(token: str) -> None:
+    """
+    Hot-swap the Bearer token without restarting the MCP server.
+
+    The next LLM call after this returns will use the new token.
+    Called by the POST /update-token endpoint on the MCP server.
+    """
+    global _client, _current_auth_token, _working_chat_model
+    with _token_lock:
+        _current_auth_token = token.strip()
+        _client = None              # force rebuild with new token on next call
+        _working_chat_model = None  # re-probe model list with new token
+    logger.info("LLM auth token updated (len=%d); client will reconnect on next call", len(token))
 
 
 def _get_client() -> OpenAI:
     """
-    Lazily initialize and reuse the OpenAI client.
+    Return (or lazily build) the OpenAI client.
 
-    Bearer mode  (LLM_AUTH_TOKEN set):
-      - api_key is set to "DUMMY" (required by SDK, ignored by server)
-      - Authorization: Bearer <token> is sent via default_headers
-      - SSL cert is already applied via os.environ above
-
-    API-key mode (LM Studio / OpenAI cloud):
-      - api_key = LLM_API_KEY from env
+    Always reads _current_auth_token so a set_auth_token() call
+    is picked up on the very next request.
     """
     global _client
-    if _client is None:
-        if LLM_AUTH_TOKEN:
-            # Corporate / hackathon endpoint
-            os.environ["OPENAI_API_KEY"] = "DUMMY"
-            _client = OpenAI(
-                base_url=LLM_BASE_URL,
-                api_key="DUMMY",
-                default_headers={"Authorization": f"Bearer {LLM_AUTH_TOKEN}"},
-            )
-            logger.info("LLM client: Bearer-token mode → %s", LLM_BASE_URL)
-        else:
-            # LM Studio / OpenAI cloud
-            _client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
-            logger.info("LLM client: API-key mode → %s", LLM_BASE_URL)
+    with _token_lock:
+        if _client is None:
+            if _current_auth_token:
+                os.environ["OPENAI_API_KEY"] = "DUMMY"
+                _client = OpenAI(
+                    base_url=LLM_BASE_URL,
+                    api_key="DUMMY",
+                    default_headers={"Authorization": f"Bearer {_current_auth_token}"},
+                )
+                logger.info("LLM client (re)built: Bearer-token mode → %s", LLM_BASE_URL)
+            else:
+                _client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+                logger.info("LLM client (re)built: API-key mode → %s", LLM_BASE_URL)
     return _client
 
 
@@ -76,8 +94,7 @@ def _get_chat_model() -> str:
     """
     Return a model ID that actually responds to chat completions.
 
-    Tries the configured CHAT_MODEL first; falls back to probing /v1/models
-    if it fails (works for LM Studio; corporate endpoints may skip this).
+    Tries the configured CHAT_MODEL first, then probes /v1/models if needed.
     """
     global _working_chat_model
     if _working_chat_model:
@@ -88,8 +105,10 @@ def _get_chat_model() -> str:
     candidates = [CHAT_MODEL]
     try:
         headers = {}
-        if LLM_AUTH_TOKEN:
-            headers["Authorization"] = f"Bearer {LLM_AUTH_TOKEN}"
+        with _token_lock:
+            tok = _current_auth_token
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
         verify = LLM_SSL_CERT if LLM_SSL_CERT else True
         resp = httpx.get(
             f"{LLM_BASE_URL}/models",
@@ -127,12 +146,7 @@ def _get_chat_model() -> str:
 
 
 def embed(text: str, model: str = "") -> list[float]:
-    """
-    Embed text using the configured embedding endpoint.
-
-    Text is truncated to 8000 chars before embedding.
-    Returns a list of EMBED_DIMS floats.
-    """
+    """Embed text. Returns a list of EMBED_DIMS floats."""
     model = model or EMBED_MODEL
     text = text[:8000]
     response = _get_client().embeddings.create(model=model, input=[text])
@@ -154,7 +168,7 @@ def _extract_json(text: str) -> Optional[dict]:
             pass
 
     start = text.find('{')
-    end = text.rfind('}')
+    end   = text.rfind('}')
     if start != -1 and end != -1 and end > start:
         try:
             return json.loads(text[start:end + 1])
@@ -225,7 +239,7 @@ def call_llm(
 
 
 def call_llm_reasoning(prompt: str, system: str, max_tokens: int = 800) -> str:
-    """Pass 1 of the scratchpad pattern: free-text reasoning, no JSON required."""
+    """Pass 1 of scratchpad pattern: free-text reasoning, no JSON required."""
     try:
         response = _get_client().chat.completions.create(
             model=_get_chat_model(),
@@ -244,7 +258,7 @@ def call_llm_reasoning(prompt: str, system: str, max_tokens: int = 800) -> str:
 
 
 def health_check() -> bool:
-    """Return True if LLM endpoint is reachable and the embedding endpoint responds."""
+    """Return True if LLM endpoint is reachable and embeddings respond."""
     try:
         result = embed("health check")
         return len(result) == EMBED_DIMS

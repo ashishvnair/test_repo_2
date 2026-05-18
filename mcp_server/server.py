@@ -4,7 +4,7 @@ server.py — MCP Tool Server (FastAPI, port 8001)
 This is the internal tool server. The api-server calls these tools.
 Each tool is exposed as POST /tools/{tool_name} accepting JSON arguments.
 
-The architecture stays: UI → api-server:8000 → mcp-server:8001/tools/* → Splunk/pgvector/LLM
+The architecture stays: UI -> api-server:8000 -> mcp-server:8001/tools/* -> Splunk/pgvector/LLM
 
 Using plain FastAPI endpoints instead of the MCP wire protocol gives us:
   - No MCP library version dependency for the HTTP transport layer
@@ -13,6 +13,7 @@ Using plain FastAPI endpoints instead of the MCP wire protocol gives us:
 
 A /health endpoint is used by docker-compose healthcheck.
 A /tools endpoint lists all available tools (mirrors MCP list_tools).
+A /update-token endpoint hot-swaps the LLM Bearer token without restart.
 
 Tools (10 total):
   fetch_logs_splunk, fetch_logs_loki, clean_logs, split_incidents,
@@ -46,11 +47,9 @@ LOKI_URL = os.getenv("LOKI_URL", "http://loki:3100")
 KNOWN_ISSUE_THRESHOLD = float(os.getenv("KNOWN_ISSUE_DISTANCE_THRESHOLD", "0.3"))
 
 # Minimum composite score (0-1) to surface a stored report as "similar".
-# Reports scoring above this threshold are shown to the user as candidates.
-# Set via env var SIMILARITY_THRESHOLD (default 0.60 = 60%).
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.60"))
 
-# 4-stage matching weights (unchanged from old matching_pipeline.py)
+# 4-stage matching weights
 W_CATEGORY = 0.15
 W_ERROR    = 0.25
 W_PILL     = 0.25
@@ -71,7 +70,7 @@ def on_startup():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Health endpoint (used by docker-compose healthcheck)
+# Health endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -81,10 +80,31 @@ def health():
     status    = "ok" if db_ok else "degraded"
     return {
         "status":   status,
-        "pgvector": "ok" if db_ok  else "error",
-        "llm":      "ok" if llm_ok else "error",
+        "pgvector": "ok" if db_ok     else "error",
+        "llm":      "ok" if llm_ok    else "error",
         "splunk":   "ok" if splunk_ok else "error",
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token refresh endpoint  POST /update-token
+# Curl: curl -s -X POST http://localhost:8001/update-token \
+#            -H "Content-Type: application/json" \
+#            -d "{\"token\": \"YOUR_NEW_TOKEN\"}"
+# ─────────────────────────────────────────────────────────────────────────────
+class TokenUpdateRequest(BaseModel):
+    token: str
+
+@app.post("/update-token")
+def update_token(body: TokenUpdateRequest):
+    """
+    Hot-swap the LLM Bearer token without restarting the MCP server.
+    Call this every time you get a new token (every ~20 min).
+    """
+    if not body.token or not body.token.strip():
+        return JSONResponse({"error": "token is empty"}, status_code=400)
+    llm.set_auth_token(body.token.strip())
+    return {"ok": True, "message": "LLM auth token updated — next call will use the new token"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,15 +121,9 @@ def list_tools():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Generic tool dispatcher  POST /tools/{tool_name}
-# Body: JSON object with tool arguments
 # ─────────────────────────────────────────────────────────────────────────────
-
 @app.post("/tools/{tool_name}")
 async def call_tool(tool_name: str, body: dict):
-    """
-    Dispatch a tool call. Body is a flat JSON dict of arguments.
-    Returns the tool result as JSON.
-    """
     try:
         result = _dispatch(tool_name, body)
         return result
@@ -121,7 +135,6 @@ async def call_tool(tool_name: str, body: dict):
 
 
 def _dispatch(tool_name: str, args: dict) -> Any:
-    """Route tool_name to the correct implementation function."""
     tools = {
         "fetch_logs_splunk":  _tool_fetch_logs_splunk,
         "fetch_logs_loki":    _tool_fetch_logs_loki,
@@ -144,26 +157,11 @@ def _dispatch(tool_name: str, args: dict) -> Any:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tool_fetch_logs_splunk(args: dict) -> dict:
-    """
-    Fetch logs for an app from Splunk REST API.
-
-    When max_events=0 (no cap) or not provided:
-      Uses SPL stats dedup at source — works for any dataset size.
-      Splunk returns ≤300 unique patterns with pre-aggregated counts.
-      total_raw_lines in the response reflects the true full count.
-
-    When max_events>0:
-      Falls back to raw fetch (for debugging / small windows).
-
-    Args: app_id, start_time ("-1h"), end_time ("now"), max_events (0 = no cap)
-    Returns: {entries, count, total_raw_lines, status}
-    """
     try:
         client = splunk_mod.get_client()
         max_events = int(args.get("max_events", 0))
 
         if max_events == 0:
-            # No cap: deduplicate at Splunk, return compact pattern set
             result = client.fetch_deduped_patterns(
                 app_id=args["app_id"],
                 start_time=args.get("start_time", "-1h"),
@@ -172,7 +170,6 @@ def _tool_fetch_logs_splunk(args: dict) -> dict:
             )
             return result
         else:
-            # Capped raw fetch (legacy / debug mode)
             entries = client.fetch_logs_for_app(
                 app_id=args["app_id"],
                 start_time=args.get("start_time", "-1h"),
@@ -191,16 +188,10 @@ def _tool_fetch_logs_splunk(args: dict) -> dict:
 
 
 def _tool_fetch_logs_loki(args: dict) -> dict:
-    """
-    Fetch logs for an app from Loki (secondary source).
-
-    Args: app_id, start_time, end_time, max_events
-    Returns: {entries: [{timestamp, raw_line, source}], count, status}
-    """
     import httpx
     try:
-        now = time.time()
-        end_ns   = args.get("end_time") or str(int(now * 1e9))
+        now      = time.time()
+        end_ns   = args.get("end_time")  or str(int(now * 1e9))
         start_ns = args.get("start_time") or str(int((now - 3600) * 1e9))
         app_id   = args["app_id"]
 
@@ -228,24 +219,12 @@ def _tool_fetch_logs_loki(args: dict) -> dict:
 
 
 def _tool_clean_logs(args: dict) -> dict:
-    """
-    Strip volatile tokens from raw log lines.
-
-    Args: raw_logs (list of {raw_line, ...})
-    Returns: {cleaned_lines: [str], count: int}
-    """
     raw_logs = args.get("raw_logs", [])
     cleaned  = [clean_log_line(e.get("raw_line", "")) for e in raw_logs]
     return {"cleaned_lines": cleaned, "count": len(cleaned)}
 
 
 def _tool_split_incidents(args: dict) -> dict:
-    """
-    Group log entries into IncidentPill objects by error fingerprint.
-
-    Args: entries (list of {timestamp, raw_line, source}), app_id
-    Returns: {incidents: [IncidentPill dict], count: int}
-    """
     pills = split_into_incidents(
         entries=args.get("entries", []),
         app_id=args.get("app_id", ""),
@@ -254,12 +233,6 @@ def _tool_split_incidents(args: dict) -> dict:
 
 
 def _tool_generate_embedding(args: dict) -> dict:
-    """
-    Embed text using LM Studio (Nomic embed text v1.5, 1024 dims).
-
-    Args: text, model (optional override)
-    Returns: {embedding: [float], dims: int}
-    """
     try:
         embedding = llm.embed(args["text"], model=args.get("model", ""))
         return {"embedding": embedding, "dims": len(embedding)}
@@ -269,18 +242,6 @@ def _tool_generate_embedding(args: dict) -> dict:
 
 
 def _tool_search_similar_rca(args: dict) -> dict:
-    """
-    pgvector cosine similarity search + 4-stage re-ranking.
-
-    Args: incident_text, embedding, app_id, n_results, distance_threshold,
-          incident_category, incident_error_type, incident_pill_text
-    Returns: {hits, best_distance, best_score, is_known_issue,
-              has_similar_reports, similar_reports}
-
-    similar_reports: top-5 hits scoring >= SIMILARITY_THRESHOLD, each with:
-      id, app_id, error_type, category, created_at, summary, severity,
-      score, similarity_pct, report (full dict)
-    """
     embedding  = args.get("embedding", [])
     app_id     = args.get("app_id", "default")
     n_results  = int(args.get("n_results", 10))
@@ -290,7 +251,7 @@ def _tool_search_similar_rca(args: dict) -> dict:
             embedding=embedding,
             app_id=app_id,
             n_results=n_results,
-            distance_threshold=2.0,  # fetch all; filter after re-rank
+            distance_threshold=2.0,
         )
     except Exception as exc:
         logger.error("pgvector query error for app_id=%s: %s", app_id, exc, exc_info=True)
@@ -320,7 +281,6 @@ def _tool_search_similar_rca(args: dict) -> dict:
                       W_PILL * pill_score + W_DISTANCE * dist_score)
 
         rep = hit.report if isinstance(hit.report, dict) else {}
-        # Extract human-readable summary (first sentence of summary or root_cause)
         raw_summary = rep.get("summary") or rep.get("root_cause") or rep.get("incident_summary") or ""
         summary_1liner = (raw_summary.split(".")[0].strip() + ".") if raw_summary else "No summary available."
 
@@ -343,14 +303,10 @@ def _tool_search_similar_rca(args: dict) -> dict:
     best_distance = best["distance"] if best else 1.0
     best_score    = best["score"]    if best else 0.0
 
-    # New behaviour: surface similar reports to user (no auto-skip)
-    similar_reports   = [h for h in scored[:5] if h["score"] >= SIMILARITY_THRESHOLD]
-    has_similar       = len(similar_reports) > 0
+    similar_reports = [h for h in scored[:5] if h["score"] >= SIMILARITY_THRESHOLD]
+    has_similar     = len(similar_reports) > 0
+    is_known        = bool(best and best_score >= 0.55 and best_distance <= KNOWN_ISSUE_THRESHOLD)
 
-    # Keep is_known_issue for backward compat (batch processor etc.)
-    is_known = bool(best and best_score >= 0.55 and best_distance <= KNOWN_ISSUE_THRESHOLD)
-
-    # Log scoring outcome so failures are visible in the MCP server terminal
     logger.info(
         "search_similar_rca: app_id=%s scored=%d best_score=%.3f "
         "threshold=%.2f has_similar=%s top_scores=%s",
@@ -362,19 +318,13 @@ def _tool_search_similar_rca(args: dict) -> dict:
         "hits":                scored,
         "best_distance":       best_distance,
         "best_score":          best_score,
-        "is_known_issue":      is_known,           # legacy compat
+        "is_known_issue":      is_known,
         "has_similar_reports": has_similar,
-        "similar_reports":     similar_reports,    # top-5 cards for UI
+        "similar_reports":     similar_reports,
     }
 
 
 def _tool_store_rca_report(args: dict) -> dict:
-    """
-    Insert accepted RCA report into pgvector.
-
-    Args: report (dict), embedding ([float]), app_id, embed_source
-    Returns: {id: str, total: int}
-    """
     embedding = args.get("embedding", [])
     if not embedding:
         msg = "store_rca_report: embedding is empty — report not stored"
@@ -396,13 +346,6 @@ def _tool_store_rca_report(args: dict) -> dict:
 
 
 def _tool_call_llm(args: dict) -> dict:
-    """
-    Call LM Studio chat completions.
-
-    Args: prompt, system, max_tokens (1500), temperature (0.3),
-          max_retries (5), required_keys ([str]), is_reasoning (False)
-    Returns: {content, parsed, attempts, _failed}
-    """
     if args.get("is_reasoning"):
         content = llm.call_llm_reasoning(
             args["prompt"], args["system"],
@@ -421,21 +364,9 @@ def _tool_call_llm(args: dict) -> dict:
 
 
 def _tool_scratchpad_write(args: dict) -> dict:
-    """
-    Write value to in-memory scratchpad with TTL.
-
-    Args: key, value, ttl_seconds (3600)
-    Returns: {ok: True, key, expires_in}
-    """
     scratchpad.write(args["key"], args["value"], ttl_seconds=int(args.get("ttl_seconds", 3600)))
     return {"ok": True, "key": args["key"], "expires_in": args.get("ttl_seconds", 3600)}
 
 
 def _tool_scratchpad_read(args: dict) -> dict:
-    """
-    Read value from scratchpad.
-
-    Args: key, default (None)
-    Returns: {value, found, expired}
-    """
     return scratchpad.read(args["key"], default=args.get("default"))

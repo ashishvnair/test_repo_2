@@ -5,26 +5,26 @@ Two distinct APIs are used:
 
 HEC (HTTP Event Collector, port 8088)
   Used for log INGESTION. Events are POSTed to /services/collector/event
-  with an Authorization: Splunk <token> header. The log_generator uses
-  this to ship 1 GB/hr of synthetic logs.
+  with an Authorization: Splunk <token> header. Only needed if you are
+  writing logs INTO Splunk (log generator, demo apps). Not required for
+  pure read/query use.
 
 REST API (port 8089, HTTPS)
   Used for log QUERYING. mcp_server uses this to fetch logs for RCA.
   Splunk's REST API is asynchronous: you create a search job, poll until
-  it's DONE, then fetch results. This is slower than HEC but gives full
-  SPL query power.
+  it's DONE, then fetch results.
 
 Auth
 ----
   HEC:  Authorization: Splunk <token>
-  REST: HTTP Basic auth (admin / SPLUNK_PASSWORD)
-  Both token and password come from environment variables.
+  REST: HTTP Basic auth (SPLUNK_USERNAME / SPLUNK_PASSWORD)
 
 SSL
 ---
-  Splunk REST runs on HTTPS with a self-signed cert in dev mode.
-  ssl_verify=False is used for local development. In production, replace
-  with ssl_verify="/path/to/cert.pem".
+  SPLUNK_SSL_VERIFY controls SSL certificate verification for the REST API:
+    "false"        → disable verification (local Docker Splunk, self-signed cert)
+    "true"         → verify using system CA bundle (production Splunk with valid cert)
+    "/path/to.pem" → verify using a specific CA bundle file
 """
 
 import json
@@ -40,11 +40,22 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-SPLUNK_HEC_URL    = os.getenv("SPLUNK_HEC_URL", "http://splunk:8088/services/collector/event")
-SPLUNK_REST_URL   = os.getenv("SPLUNK_REST_URL", "https://splunk:8089")
+SPLUNK_HEC_URL    = os.getenv("SPLUNK_HEC_URL",   "http://splunk:8088/services/collector/event")
+SPLUNK_REST_URL   = os.getenv("SPLUNK_REST_URL",  "https://splunk:8089")
 SPLUNK_HEC_TOKEN  = os.getenv("SPLUNK_HEC_TOKEN", "")
-SPLUNK_PASSWORD   = os.getenv("SPLUNK_PASSWORD", "changeme")
-SPLUNK_INDEX      = os.getenv("SPLUNK_INDEX", "rca_logs")
+SPLUNK_USERNAME   = os.getenv("SPLUNK_USERNAME",  "admin")   # ← now configurable
+SPLUNK_PASSWORD   = os.getenv("SPLUNK_PASSWORD",  "changeme")
+SPLUNK_INDEX      = os.getenv("SPLUNK_INDEX",     "rca_logs")
+
+# SSL verification for REST API calls.
+# "false" → no verify (dev/self-signed), "true" → system CA, path → custom CA
+_ssl_raw = os.getenv("SPLUNK_SSL_VERIFY", "false").strip()
+if _ssl_raw.lower() == "false":
+    SPLUNK_SSL_VERIFY: bool | str = False
+elif _ssl_raw.lower() == "true":
+    SPLUNK_SSL_VERIFY = True
+else:
+    SPLUNK_SSL_VERIFY = _ssl_raw  # treat as path to CA bundle
 
 
 class SplunkClient:
@@ -60,12 +71,12 @@ class SplunkClient:
             "Authorization": f"Splunk {SPLUNK_HEC_TOKEN}",
             "Content-Type": "application/json",
         }
-        # REST API uses basic auth and HTTPS with self-signed cert
-        self._rest_auth = ("admin", SPLUNK_PASSWORD)
+        # REST API uses basic auth
+        self._rest_auth = (SPLUNK_USERNAME, SPLUNK_PASSWORD)
         self._rest_base = SPLUNK_REST_URL.rstrip("/")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # HEC — Log ingestion
+    # HEC — Log ingestion (only needed if writing logs into Splunk)
     # ─────────────────────────────────────────────────────────────────────────
 
     def send_events(self, events: list[dict], batch_size: int = 100) -> dict:
@@ -75,12 +86,6 @@ class SplunkClient:
         Each event dict should have at minimum:
           event — the log message string or dict
           index — target Splunk index (defaults to SPLUNK_INDEX)
-
-        Splunk HEC accepts multiple events in one POST body by concatenating
-        JSON objects (NOT a JSON array) — one object per line.
-
-        Returns:
-          {"sent": int, "failed": int, "batches": int}
         """
         sent = 0
         failed = 0
@@ -88,7 +93,6 @@ class SplunkClient:
 
         for i in range(0, len(events), batch_size):
             batch = events[i:i + batch_size]
-            # Set default index if not specified per event
             body = "\n".join(
                 json.dumps({**e, "index": e.get("index", SPLUNK_INDEX)})
                 for e in batch
@@ -129,17 +133,6 @@ class SplunkClient:
           2. Poll GET /services/search/jobs/{sid} until dispatchState == DONE
           3. GET /services/search/jobs/{sid}/results?output_mode=json&count=N
           4. Return list of result dicts
-
-        Parameters
-        ----------
-        spl_query      : SPL search string (e.g. "index=rca_logs source_app_id=app-alpha")
-        earliest/latest: Splunk time range tokens (-1h, -24h, now, ISO timestamps, etc.)
-        max_count      : Maximum number of result events to fetch
-        poll_interval  : Seconds between job status polls
-        timeout        : Max seconds to wait for job to complete
-
-        Returns list of result dicts. Each dict has Splunk field names as keys.
-        Returns [] on any error (logged).
         """
         try:
             sid = self._create_job(spl_query, earliest, latest)
@@ -155,7 +148,7 @@ class SplunkClient:
     def _create_job(self, spl_query: str, earliest: str, latest: str) -> Optional[str]:
         """POST to /services/search/jobs. Returns sid (search ID) or None."""
         try:
-            with httpx.Client(verify=False, auth=self._rest_auth, timeout=30.0) as client:
+            with httpx.Client(verify=SPLUNK_SSL_VERIFY, auth=self._rest_auth, timeout=30.0) as client:
                 resp = client.post(
                     f"{self._rest_base}/services/search/jobs",
                     data={
@@ -178,7 +171,7 @@ class SplunkClient:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                with httpx.Client(verify=False, auth=self._rest_auth, timeout=15.0) as client:
+                with httpx.Client(verify=SPLUNK_SSL_VERIFY, auth=self._rest_auth, timeout=15.0) as client:
                     resp = client.get(
                         f"{self._rest_base}/services/search/jobs/{sid}",
                         params={"output_mode": "json"},
@@ -202,7 +195,7 @@ class SplunkClient:
     def _fetch_results(self, sid: str, max_count: int) -> list[dict]:
         """GET results for a completed search job."""
         try:
-            with httpx.Client(verify=False, auth=self._rest_auth, timeout=60.0) as client:
+            with httpx.Client(verify=SPLUNK_SSL_VERIFY, auth=self._rest_auth, timeout=60.0) as client:
                 resp = client.get(
                     f"{self._rest_base}/services/search/jobs/{sid}/results",
                     params={"output_mode": "json", "count": max_count},
@@ -225,63 +218,20 @@ class SplunkClient:
         """
         Fetch deduplicated error patterns from Splunk using SPL stats + token stripping.
 
-        Works for ANY dataset size — even 100M+ lines. Splunk aggregates at source
-        so only ≤max_patterns rows are returned over the wire regardless of index size.
-
-        Why 1000 patterns is always enough
-        ------------------------------------
-        Errors follow code paths. A service might log millions of lines but they
-        map to a small number of *templates*. The only way to get >1000 distinct
-        patterns is if volatile tokens (UUIDs, timestamps, request IDs, memory
-        addresses) are embedded in the message — making "timeout after 30001ms"
-        and "timeout after 30002ms" look different when they're the same error.
-
-        We strip those tokens from the dedup key with rex mode=sed BEFORE grouping,
-        so every "connection timeout" regardless of the exact millisecond maps to
-        one pattern. Real-world systems rarely exceed 50–200 unique error patterns
-        after this normalisation. 1000 is a generous ceiling.
-
-        SPL design
-        ----------
-        1. Pre-filter: keyword search for error/warn (fast term-index lookup,
-           skips all normal INFO/request logs before any aggregation).
-        2. eventstats: capture total matching-event count BEFORE dedup.
-        3. spath: extract JSON fields (error_code, message) — no regex escaping.
-        4. eval _key: build stable dedup key from structured fields or raw prefix.
-        5. rex mode=sed: strip volatile tokens from the key (UUIDs, long numbers,
-           IP addresses, hex addresses) so similar errors collapse to one pattern.
-        6. stats: collapse to ≤max_patterns rows, keeping one representative raw line.
-
-        Returns
-        -------
-        {
-          "entries":         [{timestamp, raw_line, source, pre_count}],
-          "total_raw_lines": int,   # count of error log lines (from eventstats)
-          "count":           int,   # number of unique patterns returned
-          "status":          str,
-        }
+        Works for ANY dataset size — Splunk aggregates at source so only
+        ≤max_patterns rows are returned over the wire regardless of index size.
         """
         spl_parts = [
-            # Step 1: restrict to this app's error/warning logs only
             f'index={SPLUNK_INDEX} source_app_id="{app_id}"'
             f' (error OR exception OR fail OR critical OR warn OR fatal)',
-            # Step 2: capture total error-log count before any dedup
             '| eventstats count as _total_events',
-            # Step 3: extract JSON fields via spath (no regex, no escaping issues)
             '| spath input=_raw output=_ec path=error_code',
             '| spath input=_raw output=_msg path=message',
-            # Step 4: build raw dedup key from structured fields or raw prefix
             '| eval _key=lower(coalesce(_ec,"") + "|" + coalesce(substr(_msg,1,300),substr(_raw,1,300)))',
-            # Step 5: strip volatile tokens so similar errors collapse to one pattern
-            # UUIDs (8-4-4-4-12 hex)
             '| rex field=_key mode=sed "s/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g"',
-            # Hex memory addresses (0x...)
             '| rex field=_key mode=sed "s/0x[0-9a-f]{4,}/<addr>/g"',
-            # IPv4 addresses
             '| rex field=_key mode=sed "s/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/<ip>/g"',
-            # Long standalone numbers (5+ digits: port numbers, ms timings, counts)
             '| rex field=_key mode=sed "s/[0-9]{5,}/<n>/g"',
-            # Step 6: aggregate — count occurrences, keep one representative raw line
             '| stats count, first(_raw) as sample, first(_total_events) as total_raw by _key',
             '| sort -count',
             f'| head {max_patterns}',
@@ -293,7 +243,6 @@ class SplunkClient:
             if not sid:
                 return {"entries": [], "total_raw_lines": 0, "count": 0, "status": "error: could not create job"}
 
-            # Larger timeout — Splunk needs time to scan all events
             if not self._wait_for_job(sid, poll_interval=3.0, timeout=600.0):
                 return {"entries": [], "total_raw_lines": 0, "count": 0, "status": "error: job timed out"}
 
@@ -310,10 +259,10 @@ class SplunkClient:
                     except (ValueError, TypeError):
                         pass
                 entries.append({
-                    "timestamp":  "",
-                    "raw_line":   sample,
-                    "source":     "splunk",
-                    "pre_count":  pre_count,
+                    "timestamp": "",
+                    "raw_line":  sample,
+                    "source":    "splunk",
+                    "pre_count": pre_count,
                 })
 
             return {
@@ -333,16 +282,7 @@ class SplunkClient:
         end_time: str = "now",
         max_events: int = 5000,
     ) -> list[dict]:
-        """
-        Fetch log entries for a specific app from Splunk.
-
-        The SPL query filters by the source_app_id field that the log_generator
-        sets on every event. Results are normalized to the unified format:
-          {"timestamp": str, "raw_line": str, "source": "splunk"}
-
-        This format is compatible with Loki results so the pipeline can treat
-        both sources identically after this normalization step.
-        """
+        """Fetch log entries for a specific app from Splunk."""
         spl = (
             f'index={SPLUNK_INDEX} source_app_id="{app_id}" '
             f'| eval raw_line=_raw '
@@ -363,14 +303,17 @@ class SplunkClient:
     def health(self) -> bool:
         """Return True if Splunk REST API is reachable."""
         try:
-            with httpx.Client(verify=False, auth=self._rest_auth, timeout=5.0) as client:
-                resp = client.get(f"{self._rest_base}/services/server/info", params={"output_mode": "json"})
+            with httpx.Client(verify=SPLUNK_SSL_VERIFY, auth=self._rest_auth, timeout=5.0) as client:
+                resp = client.get(
+                    f"{self._rest_base}/services/server/info",
+                    params={"output_mode": "json"},
+                )
             return resp.status_code == 200
         except Exception:
             return False
 
 
-# Module-level singleton — shared by all MCP tool calls in this process
+# Module-level singleton
 _splunk = SplunkClient()
 
 
