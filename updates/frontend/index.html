@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>RCA Platform</title>
+<link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body class="page-control">
+
+<!-- ── Topbar ─────────────────────────────────────────────────────────────── -->
+<div class="topbar">
+  <span class="brand">⚡ <span>RCA</span> Platform</span>
+  <div class="topbar-right">
+    <span class="status-dot" id="health-dot" title="Backend status"></span>
+    <span class="status-label" id="health-label">checking…</span>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     PAGE 1 — Control
+     ═══════════════════════════════════════════════════════════════════════ -->
+<div class="main" id="main-container">
+  <div class="page" id="page-control">
+
+    <!-- RCA query card -->
+    <div class="card">
+      <div class="card-title">Root Cause Analysis</div>
+      <div class="form-row">
+        <div>
+          <label for="app-select">Application</label>
+          <div class="select-wrap">
+            <select id="app-select">
+              <option value="">Loading apps…</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div>
+        <label>Time Range</label>
+        <div class="slider-row">
+          <input type="range" id="time-slider" min="1" max="1440" value="60" step="1"/>
+          <span class="slider-label-val" id="slider-label">1 h</span>
+        </div>
+        <div class="slider-ticks">
+          <span>1 min</span>
+          <span>15 min</span>
+          <span>1 h</span>
+          <span>6 h</span>
+          <span>24 h</span>
+        </div>
+      </div>
+      <button class="btn-run" id="btn-run" onclick="runRCA()">&#9654; Run RCA</button>
+    </div>
+
+  </div><!-- /#page-control -->
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       PAGE 2 — Pipeline
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div class="page" id="page-pipeline">
+
+    <div class="card">
+      <div class="pipeline-header">
+        <span class="card-title" style="margin-bottom:0">Pipeline Progress</span>
+        <button class="btn-back" onclick="cancelRCA()">&#8592; Back</button>
+      </div>
+
+      <div class="steps-list">
+        <div class="step" id="step-fetch_logs">
+          <div class="step-icon">⬜</div>
+          <div class="step-body">
+            <div class="step-label" id="label-fetch_logs">Fetch logs from Splunk</div>
+            <div class="step-meta" id="meta-fetch_logs">Waiting…</div>
+          </div>
+        </div>
+        <div class="step" id="step-clean_logs">
+          <div class="step-icon">⬜</div>
+          <div class="step-body">
+            <div class="step-label">Deduplicate &amp; fingerprint</div>
+            <div class="step-meta" id="meta-clean_logs">Waiting…</div>
+          </div>
+        </div>
+        <div class="step" id="step-log_pill">
+          <div class="step-icon">⬜</div>
+          <div class="step-body">
+            <div class="step-label">Build log pill</div>
+            <div class="step-meta" id="meta-log_pill">Waiting…</div>
+          </div>
+        </div>
+        <div class="step" id="step-vector_check">
+          <div class="step-icon">⬜</div>
+          <div class="step-body">
+            <div class="step-label">Check vector DB for known issues</div>
+            <div class="step-meta" id="meta-vector_check">Waiting…</div>
+          </div>
+        </div>
+        <div class="step" id="step-llm_analysis">
+          <div class="step-icon">⬜</div>
+          <div class="step-body">
+            <div class="step-label">AI root cause analysis</div>
+            <div class="step-meta" id="meta-llm_analysis">Waiting…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live AI generation feed — visible during llm_analysis phase -->
+      <div id="analysis-feed" class="analysis-feed" style="display:none">
+        <div class="af-header">
+          <span class="af-pulse"></span>
+          <span class="af-title">GENERATION IN PROGRESS</span>
+          <span class="af-subtitle" id="af-subtitle">Initialising…</span>
+        </div>
+        <div id="af-items" class="af-items"></div>
+      </div>
+
+      <!-- summary metrics shown after complete -->
+      <div class="summary-bar" id="summary-bar">
+        <div class="metric-box blue"><div class="val" id="sum-logs">—</div><div class="key">Logs</div></div>
+        <div class="metric-box"><div class="val" id="sum-incidents">—</div><div class="key">Patterns</div></div>
+        <div class="metric-box green"><div class="val" id="sum-known">—</div><div class="key">Known</div></div>
+        <div class="metric-box blue"><div class="val" id="sum-new">—</div><div class="key">New</div></div>
+        <div class="metric-box red"><div class="val" id="sum-failed">—</div><div class="key">Failed</div></div>
+      </div>
+    </div>
+
+  </div><!-- /#page-pipeline -->
+
+</div><!-- /#main-container -->
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     PAGE 3 — Results (full-viewport split layout, outside .main)
+     ═══════════════════════════════════════════════════════════════════════ -->
+<div class="page" id="page-results">
+  <div class="results-layout">
+
+    <!-- Left sidebar -->
+    <div class="results-sidebar">
+      <div class="sidebar-header">
+        <button class="btn-back" onclick="newAnalysis()">&#8592; New Analysis</button>
+      </div>
+      <div id="sidebar-content">
+        <!-- populated by populateSidebar() in app.js -->
+      </div>
+    </div>
+
+    <!-- Right report panel -->
+    <div class="results-main">
+      <div id="results"></div>
+    </div>
+
+  </div>
+</div><!-- /#page-results -->
+
+<script src="/static/app.js"></script>
+</body>
+</html>
