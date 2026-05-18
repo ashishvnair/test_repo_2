@@ -1,25 +1,14 @@
 """
-llm_client.py — LM Studio (OpenAI-compatible) client for chat and embeddings.
+llm_client.py — LLM client supporting both LM Studio (local) and
+Bearer-token corporate endpoints (OpenAI-compatible).
 
-Ported and extended from rca_2/backend/llm_client.py.
+Auth mode is selected by env vars:
+  - If LLM_AUTH_TOKEN is set  → Bearer token mode (corporate/hackathon endpoint)
+  - Otherwise                 → LLM_API_KEY mode (LM Studio / OpenAI cloud)
 
-Key addition: the 2-pass scratchpad pattern is embedded here as a helper
-so call_llm() callers can optionally enable it with use_scratchpad=True.
-Without scratchpad, call_llm is identical to the old self-correcting loop.
-
-Self-correcting retry loop
----------------------------
-The local LLM (Llama 3.1 8B) sometimes produces JSON with syntax errors,
-missing required keys, or extra text before/after the JSON object. The retry
-loop catches these and appends a corrective message to the conversation before
-retrying, using the model's own previous attempt as context. This converges
-in 1-2 attempts for well-formed prompts.
-
-LM Studio compatibility
-------------------------
-LM Studio exposes an OpenAI-compatible API at {LLM_BASE_URL} (default:
-http://host.docker.internal:1234/v1). The `openai` SDK is used for all calls
-because it handles retry backoff and keep-alive automatically.
+SSL:
+  - If LLM_SSL_CERT_FILE is set → that PEM file is set as SSL_CERT_FILE
+    (needed for corporate endpoints with internal CA chains)
 """
 
 import json
@@ -33,23 +22,53 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration from environment (set by docker-compose or .env)
+# Configuration from environment (set by .env / bat files)
 # ─────────────────────────────────────────────────────────────────────────────
-LLM_BASE_URL   = os.getenv("LLM_BASE_URL", "http://host.docker.internal:1234/v1")
-LLM_API_KEY    = os.getenv("LLM_API_KEY", "lm-studio")
-CHAT_MODEL     = os.getenv("LLM_CHAT_MODEL", "meta-llama-3.1-8b-instruct@q3_k_l")
-EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5")
-EMBED_DIMS     = int(os.getenv("EMBED_DIMS", "1024"))
+LLM_BASE_URL    = os.getenv("LLM_BASE_URL",    "http://host.docker.internal:1234/v1")
+LLM_API_KEY     = os.getenv("LLM_API_KEY",     "lm-studio")
+LLM_AUTH_TOKEN  = os.getenv("LLM_AUTH_TOKEN",  "")          # Bearer token (corporate endpoint)
+LLM_SSL_CERT    = os.getenv("LLM_SSL_CERT_FILE", "")        # path to CA chain PEM
+CHAT_MODEL      = os.getenv("LLM_CHAT_MODEL",  "meta-llama-3.1-8b-instruct@q3_k_l")
+EMBED_MODEL     = os.getenv("EMBED_MODEL",     "text-embedding-nomic-embed-text-v1.5")
+EMBED_DIMS      = int(os.getenv("EMBED_DIMS",  "1024"))
+
+# Apply SSL cert override at import time so all http libs pick it up
+if LLM_SSL_CERT:
+    os.environ["SSL_CERT_FILE"] = LLM_SSL_CERT
+    os.environ["REQUESTS_CA_BUNDLE"] = LLM_SSL_CERT
+    logger.info("SSL_CERT_FILE set to: %s", LLM_SSL_CERT)
 
 _client: Optional[OpenAI] = None
 _working_chat_model: Optional[str] = None  # cached after first successful call
 
 
 def _get_client() -> OpenAI:
-    """Lazily initialize and reuse the OpenAI client."""
+    """
+    Lazily initialize and reuse the OpenAI client.
+
+    Bearer mode  (LLM_AUTH_TOKEN set):
+      - api_key is set to "DUMMY" (required by SDK, ignored by server)
+      - Authorization: Bearer <token> is sent via default_headers
+      - SSL cert is already applied via os.environ above
+
+    API-key mode (LM Studio / OpenAI cloud):
+      - api_key = LLM_API_KEY from env
+    """
     global _client
     if _client is None:
-        _client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+        if LLM_AUTH_TOKEN:
+            # Corporate / hackathon endpoint
+            os.environ["OPENAI_API_KEY"] = "DUMMY"
+            _client = OpenAI(
+                base_url=LLM_BASE_URL,
+                api_key="DUMMY",
+                default_headers={"Authorization": f"Bearer {LLM_AUTH_TOKEN}"},
+            )
+            logger.info("LLM client: Bearer-token mode → %s", LLM_BASE_URL)
+        else:
+            # LM Studio / OpenAI cloud
+            _client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+            logger.info("LLM client: API-key mode → %s", LLM_BASE_URL)
     return _client
 
 
@@ -57,11 +76,8 @@ def _get_chat_model() -> str:
     """
     Return a model ID that actually responds to chat completions.
 
-    LM Studio only serves models that are explicitly loaded in its UI.
-    This function probes the /v1/models list and tries each non-embedding
-    model until one responds successfully, then caches it.
-
-    Falls back to CHAT_MODEL (from env) if nothing can be tested.
+    Tries the configured CHAT_MODEL first; falls back to probing /v1/models
+    if it fails (works for LM Studio; corporate endpoints may skip this).
     """
     global _working_chat_model
     if _working_chat_model:
@@ -69,10 +85,18 @@ def _get_chat_model() -> str:
 
     import httpx
 
-    # Build candidate list: configured model first, then all listed models
     candidates = [CHAT_MODEL]
     try:
-        resp = httpx.get(f"{LLM_BASE_URL}/models", timeout=5.0)
+        headers = {}
+        if LLM_AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {LLM_AUTH_TOKEN}"
+        verify = LLM_SSL_CERT if LLM_SSL_CERT else True
+        resp = httpx.get(
+            f"{LLM_BASE_URL}/models",
+            headers=headers,
+            verify=verify,
+            timeout=5.0,
+        )
         if resp.status_code == 200:
             for m in resp.json().get("data", []):
                 mid = m.get("id", "")
@@ -88,6 +112,7 @@ def _get_chat_model() -> str:
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=3,
                 temperature=0.0,
+                user=os.getenv("USERNAME", ""),
             )
             if resp.choices and resp.choices[0].message.content is not None:
                 logger.info("Auto-detected working chat model: %s", mid)
@@ -103,12 +128,10 @@ def _get_chat_model() -> str:
 
 def embed(text: str, model: str = "") -> list[float]:
     """
-    Embed text using LM Studio's embedding endpoint.
+    Embed text using the configured embedding endpoint.
 
-    Text is truncated to 8000 characters before embedding — the Nomic model
-    has an 8192-token context limit and long inputs degrade embedding quality.
-
-    Returns a list of EMBED_DIMS floats (default 1024 for Nomic embed text v1.5).
+    Text is truncated to 8000 chars before embedding.
+    Returns a list of EMBED_DIMS floats.
     """
     model = model or EMBED_MODEL
     text = text[:8000]
@@ -117,22 +140,12 @@ def embed(text: str, model: str = "") -> list[float]:
 
 
 def _extract_json(text: str) -> Optional[dict]:
-    """
-    Try to extract a JSON object from arbitrary LLM output text.
-
-    The LLM sometimes wraps JSON in markdown code fences or prepends prose.
-    This function handles the common cases:
-      1. Pure JSON
-      2. JSON inside ```json ... ``` blocks
-      3. JSON preceded or followed by prose text
-    """
-    # Try direct parse first (fast path)
+    """Extract a JSON object from arbitrary LLM output text."""
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
         pass
 
-    # Strip markdown code fences
     fence_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
     if fence_match:
         try:
@@ -140,7 +153,6 @@ def _extract_json(text: str) -> Optional[dict]:
         except json.JSONDecodeError:
             pass
 
-    # Find the outermost {...} block
     start = text.find('{')
     end = text.rfind('}')
     if start != -1 and end != -1 and end > start:
@@ -161,34 +173,17 @@ def call_llm(
     required_keys: Optional[list[str]] = None,
 ) -> dict:
     """
-    Call LM Studio chat completions with a self-correcting retry loop.
+    Call LLM chat completions with a self-correcting retry loop.
 
-    Ported from flask_app.py _self_correcting_rca(), generalized for any prompt.
-
-    Parameters
-    ----------
-    prompt        : User message content
-    system        : System prompt
-    max_tokens    : Max completion tokens
-    temperature   : Sampling temperature (lower = more deterministic)
-    max_retries   : Max attempts before returning a failure dict
-    required_keys : If provided, returned JSON must contain all these top-level keys
-
-    Returns
-    -------
-    dict with:
-      content   — raw LLM text output (last attempt)
-      parsed    — parsed JSON dict, or None if all retries failed
-      attempts  — number of attempts made
-      _failed   — True if all retries exhausted without valid output
+    Returns dict: {content, parsed, attempts, _failed}
     """
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": prompt},
+        {"role": "user",   "content": prompt},
     ]
     last_content = ""
-
     model = _get_chat_model()
+
     for attempt in range(1, max_retries + 1):
         try:
             response = _get_client().chat.completions.create(
@@ -196,6 +191,7 @@ def call_llm(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                user=os.getenv("USERNAME", ""),
             )
             content = response.choices[0].message.content or ""
             last_content = content
@@ -203,7 +199,6 @@ def call_llm(
             logger.debug("LLM raw output (attempt %d): %s", attempt, content[:500])
             parsed = _extract_json(content)
             if parsed is None:
-                # Only retry when JSON is completely unparseable
                 messages.append({"role": "assistant", "content": content})
                 messages.append({
                     "role": "user",
@@ -216,8 +211,6 @@ def call_llm(
                 logger.warning("LLM attempt %d/%d: JSON parse failed", attempt, max_retries)
                 continue
 
-            # Successfully parsed — return immediately regardless of which keys are present
-            # (caller handles missing/empty values via post-parse cleanup)
             logger.info("LLM succeeded on attempt %d/%d", attempt, max_retries)
             return {"content": content, "parsed": parsed, "attempts": attempt, "_failed": False}
 
@@ -225,34 +218,24 @@ def call_llm(
             logger.error("LLM attempt %d/%d exception: %s", attempt, max_retries, exc)
             if attempt == max_retries:
                 break
-            # On API error, don't append to messages — just retry clean
             continue
 
     logger.error("LLM failed after %d attempts", max_retries)
-    return {
-        "content": last_content,
-        "parsed": None,
-        "attempts": max_retries,
-        "_failed": True,
-    }
+    return {"content": last_content, "parsed": None, "attempts": max_retries, "_failed": True}
 
 
 def call_llm_reasoning(prompt: str, system: str, max_tokens: int = 800) -> str:
-    """
-    Pass 1 of the scratchpad pattern: free-text reasoning, no JSON required.
-
-    Returns raw text — not JSON. This is stored in the scratchpad and used
-    as context for Pass 2 (call_llm with json schema).
-    """
+    """Pass 1 of the scratchpad pattern: free-text reasoning, no JSON required."""
     try:
         response = _get_client().chat.completions.create(
             model=_get_chat_model(),
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
+                {"role": "user",   "content": prompt},
             ],
             max_tokens=max_tokens,
-            temperature=0.5,  # slightly higher for broader reasoning
+            temperature=0.5,
+            user=os.getenv("USERNAME", ""),
         )
         return response.choices[0].message.content or ""
     except Exception as exc:
@@ -261,7 +244,7 @@ def call_llm_reasoning(prompt: str, system: str, max_tokens: int = 800) -> str:
 
 
 def health_check() -> bool:
-    """Return True if LM Studio is reachable and the embedding endpoint responds."""
+    """Return True if LLM endpoint is reachable and the embedding endpoint responds."""
     try:
         result = embed("health check")
         return len(result) == EMBED_DIMS
